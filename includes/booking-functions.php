@@ -12,32 +12,65 @@
  * @return int|bool Booking ID on success, false on failure
  */
 function createBooking($userId, $chargingPointId, $bookingDatetime) {
-    // Check if the charging point is available
-    if (!isChargingPointAvailable($chargingPointId, $bookingDatetime)) {
-        return false;
-    }
-
-    // Insert booking data
-    $bookingData = [
-        'user_id' => $userId,
-        'charging_point_id' => $chargingPointId,
-        'booking_datetime' => $bookingDatetime
-    ];
-
-    $bookingId = insert('Bookings', $bookingData);
-
-    if ($bookingId) {
-        // Update charging point status
-        update('Charging_Points',
-            ['charging_point_state' => 'reserved'],
-            'charging_point_id = ?',
+    try {
+        // Check if the charging point exists and is available
+        $point = fetchOne(
+            "SELECT charging_point_id, charging_point_state FROM Charging_Points WHERE charging_point_id = ?",
             [$chargingPointId]
         );
 
-        return $bookingId;
-    }
+        if (!$point || $point['charging_point_state'] !== 'available') {
+            return false;
+        }
 
-    return false;
+        // Check for existing bookings at the same time
+        $existingBooking = fetchOne(
+            "SELECT booking_id FROM Bookings 
+            WHERE charging_point_id = ? AND booking_datetime = ?",
+            [$chargingPointId, $bookingDatetime]
+        );
+
+        if ($existingBooking) {
+            return false;
+        }
+
+        // Insert booking data
+        $bookingData = [
+            'user_id' => $userId,
+            'charging_point_id' => $chargingPointId,
+            'booking_datetime' => $bookingDatetime
+        ];
+
+        $conn = getDbConnection();
+        
+        // Start transaction
+        $conn->begin_transaction();
+
+        try {
+            // Insert booking
+            $stmt = $conn->prepare("INSERT INTO Bookings (user_id, charging_point_id, booking_datetime) VALUES (?, ?, ?)");
+            $stmt->bind_param("iis", $userId, $chargingPointId, $bookingDatetime);
+            $stmt->execute();
+            $bookingId = $conn->insert_id;
+
+            // Update charging point status
+            $stmt = $conn->prepare("UPDATE Charging_Points SET charging_point_state = 'reserved' WHERE charging_point_id = ?");
+            $stmt->bind_param("i", $chargingPointId);
+            $stmt->execute();
+
+            // Commit transaction
+            $conn->commit();
+            return $bookingId;
+        } catch (Exception $e) {
+            // Rollback on error
+            $conn->rollback();
+            error_log("Booking creation error: " . $e->getMessage());
+            return false;
+        }
+    } catch (Exception $e) {
+        error_log("Booking error: " . $e->getMessage());
+        return false;
+    }
 }
 
 /**
@@ -141,49 +174,4 @@ function isChargingPointAvailable($chargingPointId, $bookingDatetime) {
     $result = fetchOne($sql, [$chargingPointId, $bookingDatetime]);
 
     return $result['count'] == 0;
-}
-
-/**
- * Start a charging session
- *
- * @param int $bookingId Booking ID
- * @return int|bool Charging log ID on success, false on failure
- */
-function startChargingSession($bookingId) {
-    // Get booking details
-    $booking = getBookingDetails($bookingId);
-
-    if (!$booking) {
-        return false;
-    }
-
-    // Create charging log
-    $logData = [
-        'booking_id' => $bookingId,
-        'user_id' => $booking['user_id'],
-        'charging_point_id' => $booking['charging_point_id'],
-        'start_time' => date('Y-m-d H:i:s'),
-        'status' => 'in_progress'
-    ];
-
-    return insert('Charging_Logs', $logData);
-}
-
-/**
- * End a charging session
- *
- * @param int $logsId Charging log ID
- * @param float $energyConsumed Energy consumed in kWh
- * @param float $cost Total cost
- * @return bool True on success, false on failure
- */
-function endChargingSession($logsId, $energyConsumed, $cost) {
-    // Update charging log
-    $logData = [
-        'end_time' => date('Y-m-d H:i:s'),
-        'energy_consumed' => $energyConsumed,
-        'cost' => $cost
-    ];
-
-    return update('Charging_Logs', $logData, 'logs_id = ?', [$logsId]);
 }
